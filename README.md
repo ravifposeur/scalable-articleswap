@@ -1,7 +1,3 @@
-Saya akan menulis ulang panduan tersebut dalam bahasa yang lebih formal, sederhana, dan tanpa emotikon. Karena saya adalah model teks, saya tidak dapat langsung menghasilkan file `.docx`, tetapi saya akan memberikan teks dalam format yang siap untuk Anda salin dan tempelkan ke dokumen Word atau Google Docs, lalu simpan sebagai `.docx`.
-
----
-
 ### PANDUAN KOLABORASI PROYEK SCALABLE ARTICLESWAP
 
 #### Pendahuluan
