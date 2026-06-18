@@ -1,0 +1,121 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: articleswap_broker
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    networks:
+      - articleswap_net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: articleswap_db
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - articleswap_net
+
+  pgbouncer:
+    image: edoburu/pgbouncer
+    container_name: articleswap_pool
+    environment:
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASS}
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "6432:5432"
+    depends_on:
+      - postgres
+    networks:
+      - articleswap_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: articleswap_cache
+    ports:
+      - "6379:6379"
+    networks:
+      - articleswap_net
+
+  nginx_lb:
+    image: nginx:alpine
+    container_name: articleswap_lb
+    ports:
+      - "8080:80"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api_gateway_1
+      - api_gateway_2
+    networks:
+      - articleswap_net
+
+  api_gateway_1:
+    build: ./service-article
+    image: alpine
+    container_name: article_app_1
+    restart: on-failure
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+      - pgbouncer
+    networks:
+      - articleswap_net
+
+  api_gateway_2:
+    build: ./service-article
+    image: alpine
+    container_name: article_app_2
+    restart: on-failure
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+      - pgbouncer
+    networks:
+      - articleswap_net
+
+  worker_stemming:
+    build: ./worker-stemming
+    image: alpine
+    container_name: worker_stemming_1
+    restart: on-failure
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+      - pgbouncer
+    networks:
+      - articleswap_net
+
+  worker_wordcloud:
+    build: ./worker-wordcloud
+    image: alpine
+    container_name: worker_wordcloud_1
+    restart: on-failure
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+      - pgbouncer
+    networks:
+      - articleswap_net
+
+networks:
+  articleswap_net:
+    driver: bridge
