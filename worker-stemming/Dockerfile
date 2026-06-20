@@ -19,4 +19,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Menjalankan worker
-CMD ["python", "worker_stemming.py"]
+CMD ["python", "-u", "worker_stemming.py"]

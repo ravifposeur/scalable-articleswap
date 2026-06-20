@@ -1,50 +1,47 @@
+import json
+import logging
+import os
+import sys
+import time
+
 import pika
 import psycopg2
-import json
-import os
-import logging
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
-
-# Logging configuration
+# Setup logging ke terminal
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("worker_stemming")
 
-# Initialize Sastrawi stemmer
+# Inisialisasi Sastrawi Stemmer
+logger.info("Initializing Sastrawi Stemmer engine...")
 factory = StemmerFactory()
 stemmer = factory.create_stemmer()
 
-# Database configuration
-DB_HOST = os.getenv('DB_HOST', 'pgbouncer')
-DB_PORT = os.getenv('DB_PORT', '5432')
-DB_NAME = os.getenv('DB_NAME')
-DB_USER = os.getenv('DB_USER')
-DB_PASS = os.getenv('DB_PASS')
+# Konfigurasi dinamis penuh dari .env
+DB_HOST = os.getenv("DB_HOST", "pgbouncer")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "articleswap")
+DB_USER = os.getenv("DB_USER", "articleuser")
+DB_PASS = os.getenv("DB_PASS", "articlepassword")
 
-# RabbitMQ configuration
-RMQ_HOST = os.getenv('RABBITMQ_HOST', 'rabbitmq')
-RMQ_USER = os.getenv('RABBITMQ_USER')
-RMQ_PASS = os.getenv('RABBITMQ_PASS')
+RMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
+RMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+RMQ_USER = os.getenv("RABBITMQ_USER", "admin")
+RMQ_PASS = os.getenv("RABBITMQ_PASS", "secretpassword")
 
-# RabbitMQ queue name
-QUEUE_NAME = 'article_queue'
+EXCHANGE_NAME = os.getenv("RABBITMQ_EXCHANGE", "articles_exchange")
+QUEUE_NAME = os.getenv("RABBITMQ_QUEUE_STEMMING", "stemming_queue")
 
 
 def get_db_connection():
-    """Membuat koneksi ke PostgreSQL melalui PgBouncer"""
+    """Membuat koneksi ke PostgreSQL via PgBouncer"""
     try:
         conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASS
+            host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS
         )
         return conn
     except Exception as e:
@@ -53,134 +50,103 @@ def get_db_connection():
 
 
 def update_article_stemmed(article_id, stemmed_content):
-    """Memperbarui kolom stemmed_content dan status menjadi 'completed' di PostgreSQL"""
+    """Menyimpan hasil stemming ke DB dan mengubah status"""
+    conn = get_db_connection()
+    if not conn:
+        return False
     try:
-        conn = get_db_connection()
-        if not conn:
-            logger.error("Failed to connect to database")
-            return False
-
-        cursor = conn.cursor()
-        query = """
-            UPDATE articles 
-            SET stemmed_content = %s, status = 'completed', updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """
-        cursor.execute(query, (stemmed_content, article_id))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        logger.info(f"Article {article_id} updated successfully with stemmed content")
+        with conn.cursor() as cursor:
+            query = """
+                UPDATE articles
+                SET stemmed_content = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s::uuid
+            """
+            cursor.execute(query, (stemmed_content, article_id))
+            conn.commit()
         return True
     except Exception as e:
-        logger.error(f"Error updating article {article_id}: {e}")
+        logger.error(f"Error updating article {article_id} in DB: {e}")
         return False
-
-
-def update_article_status(article_id, status):
-    """Memperbarui status artikel di PostgreSQL"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            logger.error("Failed to connect to database")
-            return False
-
-        cursor = conn.cursor()
-        query = """
-            UPDATE articles 
-            SET status = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """
-        cursor.execute(query, (status, article_id))
-        conn.commit()
-        cursor.close()
+    finally:
         conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"Error updating article status: {e}")
-        return False
 
 
 def process_message(ch, method, properties, body):
-    """Callback untuk memproses pesan dari RabbitMQ"""
+    """Callback ketika ada pesan masuk dari Fanout Exchange Go"""
     try:
-        # Parse JSON message
-        message = json.loads(body)
-        article_id = message.get('article_id')
-        raw_content = message.get('raw_content')
+        # Sinkronisasi format JSON dari Go Backend: {"id": "uuid", "text": "isi"}
+        message = json.loads(body.decode("utf-8"))
+        article_id = message.get("id")
+        raw_content = message.get("text")
 
         if not article_id or not raw_content:
-            logger.error(f"Invalid message format: {message}")
+            logger.warning(f"Payload pesan cacat / tidak valid. Diabaikan: {message}")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
-        logger.info(f"Processing article {article_id}...")
+        logger.info(f"[*] Article [{article_id}] -> Memulai proses stemming NLP...")
 
-        # Update status to processing
-        update_article_status(article_id, 'processing')
-
-        # Perform stemming
+        # Eksekusi algoritma Sastrawi
         stemmed_text = stemmer.stem(raw_content)
-        logger.info(f"Stemming completed for article {article_id}")
+        logger.info(f"[+] Article [{article_id}] -> Stemming selesai.")
 
-        # Update database with stemmed content
+        # Update database
         if update_article_stemmed(article_id, stemmed_text):
-            logger.info(f"Article {article_id} processing completed successfully")
+            logger.info(f"[✓] Article [{article_id}] -> Berhasil disimpan ke DB.")
             ch.basic_ack(delivery_tag=method.delivery_tag)
         else:
-            logger.error(f"Failed to update article {article_id}")
-            # Negative acknowledge to requeue the message
+            logger.error(
+                f"[x] Article [{article_id}] -> Gagal simpan ke DB. Requeue pesan."
+            )
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
+        logger.error(f"Format JSON error: {e}")
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        # Negative acknowledge to requeue the message
+        logger.error(f"Error tidak terduga saat memproses pesan: {e}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
 def main():
-    """Main function untuk menjalankan worker"""
-    logger.info("Starting Worker Stemming...")
+    logger.info("Starting Worker Stemming Service...")
 
-    # Setup RabbitMQ connection
     credentials = pika.PlainCredentials(RMQ_USER, RMQ_PASS)
     parameters = pika.ConnectionParameters(
         host=RMQ_HOST,
-        port=5672,
+        port=RMQ_PORT,
         credentials=credentials,
         heartbeat=600,
-        blocked_connection_timeout=300
+        blocked_connection_timeout=300,
     )
 
-    try:
-        connection = pika.BlockingConnection(parameters)
-        channel = connection.channel()
-
-        # Declare queue
-        channel.queue_declare(queue=QUEUE_NAME, durable=True)
-
-        # Set QoS (prefetch count)
-        channel.basic_qos(prefetch_count=1)
-
-        # Set up consumer
-        channel.basic_consume(
-            queue=QUEUE_NAME,
-            on_message_callback=process_message
-        )
-
-        logger.info(f"Worker Stemming listening on queue '{QUEUE_NAME}'")
-        channel.start_consuming()
-
-    except Exception as e:
-        logger.error(f"Connection error: {e}")
-    finally:
+    while True:
         try:
-            connection.close()
-        except:
-            pass
+            connection = pika.BlockingConnection(parameters)
+            channel = connection.channel()
+
+            # Pastikan Exchange dan Queue terbentuk & terikat (Bound) satu sama lain
+            channel.exchange_declare(
+                exchange=EXCHANGE_NAME, exchange_type="fanout", durable=True
+            )
+            channel.queue_declare(queue=QUEUE_NAME, durable=True)
+            channel.queue_bind(exchange=EXCHANGE_NAME, queue=QUEUE_NAME)
+
+            # Prefetch count = 1 agar pembagian kerja seimbang jika container di-scale
+            channel.basic_qos(prefetch_count=1)
+            channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_message)
+
+            logger.info(f"🚀 Worker Stemming mendengarkan antrean '{QUEUE_NAME}'...")
+            channel.start_consuming()
+
+        except pika.exceptions.AMQPConnectionError:
+            logger.warning(
+                "Koneksi ke RabbitMQ terputus. Mencoba menyambung ulang dalam 5 detik..."
+            )
+            time.sleep(5)
+        except KeyboardInterrupt:
+            logger.info("Worker dihentikan oleh pengguna.")
+            break
 
 
 if __name__ == "__main__":

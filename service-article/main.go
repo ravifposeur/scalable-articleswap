@@ -17,18 +17,15 @@ import (
 // Domain types
 // ---------------------------------------------------------------------------
 
-// submitRequest is the expected JSON body for POST /api/submit.
 type submitRequest struct {
 	Text string `json:"text"`
 }
 
-// submitResponse is returned immediately with HTTP 202 after a successful submit.
 type submitResponse struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 }
 
-// articleResult is the shape of a row returned by GET /api/forward.
 type articleResult struct {
 	ID             string  `json:"id"`
 	Status         string  `json:"status"`
@@ -39,7 +36,6 @@ type articleResult struct {
 	UpdatedAt      string  `json:"updated_at"`
 }
 
-// publishPayload is what we put on the RabbitMQ exchange.
 type publishPayload struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
@@ -50,21 +46,23 @@ type publishPayload struct {
 // ---------------------------------------------------------------------------
 
 type App struct {
-	db      *pgxpool.Pool
-	amqpCh  *amqp.Channel
-	amqpConn *amqp.Connection
+	db           *pgxpool.Pool
+	amqpCh       *amqp.Channel
+	amqpConn     *amqp.Connection
+	exchangeName string // <-- Pindahkan ke sini agar dinamis dari .env
 }
-
-const exchangeName = "articles_exchange"
 
 // ---------------------------------------------------------------------------
 // Startup helpers
 // ---------------------------------------------------------------------------
 
 func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
-	dsn := fmt.Sprintf("postgres://%s:%s@pgbouncer:5432/%s",
+	// SINKRONISASI: Menggunakan DB_HOST, DB_PORT, dan mematikan sslmode secara eksplisit
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
 		os.Getenv("DB_USER"),
 		os.Getenv("DB_PASS"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
 		os.Getenv("DB_NAME"),
 	)
 
@@ -73,7 +71,7 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 		pool, err := pgxpool.New(ctx, dsn)
 		if err == nil {
 			if pingErr := pool.Ping(ctx); pingErr == nil {
-				log.Printf("[DB] Connected to PostgreSQL via PgBouncer (attempt %d)", i)
+				log.Printf("[DB] Connected to PostgreSQL via %s:%s (attempt %d)", os.Getenv("DB_HOST"), os.Getenv("DB_PORT"), i)
 				return pool, nil
 			} else {
 				pool.Close()
@@ -86,8 +84,7 @@ func connectDB(ctx context.Context) (*pgxpool.Pool, error) {
 	return nil, fmt.Errorf("could not connect to PostgreSQL after %d attempts", maxAttempts)
 }
 
-
-func connectRabbitMQ() (*amqp.Connection, *amqp.Channel, error) {
+func connectRabbitMQ(exchangeName string) (*amqp.Connection, *amqp.Channel, error) {
 	url := fmt.Sprintf("amqp://%s:%s@rabbitmq:5672/",
 		os.Getenv("RABBITMQ_USER"),
 		os.Getenv("RABBITMQ_PASS"),
@@ -117,20 +114,19 @@ func connectRabbitMQ() (*amqp.Connection, *amqp.Channel, error) {
 	}
 
 	if err := ch.ExchangeDeclare(
-		exchangeName, 
-		"fanout",     
-		true,         
-		false,        
-		false,        
-		false,        
-		nil,          
+		exchangeName,
+		"fanout",
+		true,
+		false,
+		false,
+		false,
+		nil,
 	); err != nil {
 		ch.Close()
 		conn.Close()
 		return nil, nil, fmt.Errorf("could not declare exchange: %w", err)
 	}
 
-	// Enable publisher confirms so we know the broker acknowledged every message.
 	if err := ch.Confirm(false); err != nil {
 		ch.Close()
 		conn.Close()
@@ -145,12 +141,6 @@ func connectRabbitMQ() (*amqp.Connection, *amqp.Channel, error) {
 // Handlers
 // ---------------------------------------------------------------------------
 
-// handleSubmit implements POST /api/submit
-//
-// 1. Decode {"text": "..."} from the request body.
-// 2. INSERT a new row into the articles table (status = pending).
-// 3. Respond with HTTP 202 + {"id": "...", "status": "pending"}.
-// 4. Publish {"id": "...", "text": "..."} to the RabbitMQ fanout exchange.
 func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -165,7 +155,6 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- 1. Persist to PostgreSQL ---
 	var articleID string
 	err := a.db.QueryRow(
 		r.Context(),
@@ -180,7 +169,6 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- 2. Respond immediately with 202 ---
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(submitResponse{
@@ -188,7 +176,6 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Status: "pending",
 	})
 
-	// --- 3. Publish to RabbitMQ (after the response is flushed) ---
 	payload, _ := json.Marshal(publishPayload{ID: articleID, Text: req.Text})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -198,10 +185,10 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	pubErr := a.amqpCh.PublishWithContext(
 		ctx,
-		exchangeName, 
-		"",           
-		true,         
-		false,        
+		a.exchangeName, // <-- Menggunakan variabel dari instance struct App
+		"",
+		true,
+		false,
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
@@ -225,11 +212,6 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleForward implements GET /api/forward
-//
-// Query params:
-//   - ?id=<uuid>  → fetch a specific article
-//   - (none)      → fetch all articles (ordered by created_at DESC, limit 50)
 func (a *App) handleForward(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -237,7 +219,6 @@ func (a *App) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-
 	id := r.URL.Query().Get("id")
 
 	if id != "" {
@@ -317,19 +298,22 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, `{"status":"ok"}`)
 }
 
-
-
 func main() {
 	ctx := context.Background()
 
-	// --- Connect to infrastructure (with retry) ---
+	// Ambil nama exchange secara dinamis dari .env saat program dinyalakan
+	envExchange := os.Getenv("RABBITMQ_EXCHANGE")
+	if envExchange == "" {
+		envExchange = "articles_exchange" // default fallback
+	}
+
 	db, err := connectDB(ctx)
 	if err != nil {
 		log.Fatalf("[startup] %v", err)
 	}
 	defer db.Close()
 
-	amqpConn, amqpCh, err := connectRabbitMQ()
+	amqpConn, amqpCh, err := connectRabbitMQ(envExchange)
 	if err != nil {
 		log.Fatalf("[startup] %v", err)
 	}
@@ -337,9 +321,10 @@ func main() {
 	defer amqpConn.Close()
 
 	app := &App{
-		db:       db,
-		amqpCh:   amqpCh,
-		amqpConn: amqpConn,
+		db:           db,
+		amqpCh:       amqpCh,
+		amqpConn:     amqpConn,
+		exchangeName: envExchange, // Inisialisasi struct
 	}
 
 	mux := http.NewServeMux()

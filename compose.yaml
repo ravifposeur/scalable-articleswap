@@ -64,9 +64,12 @@ services:
     networks:
       - articleswap_net
 
+  # =========================================================================
+  # AMAN: Tag image dihapus/diganti unik agar tidak merusak cache antar-servis
+  # =========================================================================
   api_gateway_1:
     build: ./service-article
-    image: alpine
+    image: articleswap-go-backend:latest # <-- Diberi nama tag spesifik
     container_name: article_app_1
     restart: on-failure
     env_file:
@@ -79,7 +82,7 @@ services:
 
   api_gateway_2:
     build: ./service-article
-    image: alpine
+    image: articleswap-go-backend:latest # <-- Menggunakan base image hasil build yang sama
     container_name: article_app_2
     restart: on-failure
     env_file:
@@ -92,7 +95,7 @@ services:
 
   worker_stemming:
     build: ./worker-stemming
-    image: alpine
+    image: articleswap-worker-stemming:latest # <-- Tag unik khusus python stemming
     container_name: worker_stemming_1
     restart: on-failure
     env_file:
@@ -105,13 +108,13 @@ services:
 
   worker_wordcloud:
     build: ./worker-wordcloud
-    image: alpine
+    image: articleswap-worker-wordcloud:latest # <-- Tag unik khusus python wordcloud
     container_name: worker_wordcloud_1
     restart: on-failure
     env_file:
       - .env
     volumes:
-      - ./worker-wordcloud/output:/app/output  # Mount volume agar gambar word cloud persist
+      - ./worker-wordcloud/output:/app/output
     depends_on:
       - rabbitmq
       - pgbouncer

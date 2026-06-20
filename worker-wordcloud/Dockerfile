@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Menjalankan worker
-CMD ["python", "worker_wordcloud.py"]
+CMD ["python", "-u", "worker_wordcloud.py"]
