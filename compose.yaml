@@ -110,6 +110,8 @@ services:
     restart: on-failure
     env_file:
       - .env
+    volumes:
+      - ./worker-wordcloud/output:/app/output  # Mount volume agar gambar word cloud persist
     depends_on:
       - rabbitmq
       - pgbouncer
